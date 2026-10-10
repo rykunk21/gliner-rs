@@ -20,7 +20,10 @@ pub struct ChunkOptions {
 
 impl Default for ChunkOptions {
     fn default() -> Self {
-        Self { chunk_size: 384, chunk_overlap: 64 }
+        Self {
+            chunk_size: 384,
+            chunk_overlap: 64,
+        }
     }
 }
 
@@ -34,13 +37,23 @@ pub struct TextChunk {
 }
 
 /// Split `text` into overlapping word windows.
-pub fn split_text_into_chunks(text: &str, opts: ChunkOptions, splitter: WordSplitter) -> Result<Vec<TextChunk>> {
+pub fn split_text_into_chunks(
+    text: &str,
+    opts: ChunkOptions,
+    splitter: WordSplitter,
+) -> Result<Vec<TextChunk>> {
     ensure!(opts.chunk_size > 0, "chunk_size must be greater than 0");
-    ensure!(opts.chunk_overlap < opts.chunk_size, "chunk_overlap must be smaller than chunk_size");
+    ensure!(
+        opts.chunk_overlap < opts.chunk_size,
+        "chunk_overlap must be smaller than chunk_size"
+    );
 
     let words = splitter.split(text, false);
     if words.is_empty() {
-        return Ok(vec![TextChunk { text: text.to_string(), start_char: 0 }]);
+        return Ok(vec![TextChunk {
+            text: text.to_string(),
+            start_char: 0,
+        }]);
     }
 
     let mut chunks = Vec::new();
@@ -51,7 +64,10 @@ pub fn split_text_into_chunks(text: &str, opts: ChunkOptions, splitter: WordSpli
         let start_byte = words[start_word].byte_start;
         let end_byte = words[end_word - 1].byte_end;
         let start_char = words[start_word].char_start;
-        chunks.push(TextChunk { text: text[start_byte..end_byte].to_string(), start_char });
+        chunks.push(TextChunk {
+            text: text[start_byte..end_byte].to_string(),
+            start_char,
+        });
         if end_word == words.len() {
             break;
         }
@@ -70,26 +86,48 @@ fn char_byte_offsets(text: &str) -> Vec<usize> {
 }
 
 fn is_span_value(v: &Value) -> bool {
-    v.as_object().is_some_and(|m| m.contains_key("text") && m.get("start").is_some_and(Value::is_u64) && m.get("end").is_some_and(Value::is_u64))
+    v.as_object().is_some_and(|m| {
+        m.contains_key("text")
+            && m.get("start").is_some_and(Value::is_u64)
+            && m.get("end").is_some_and(Value::is_u64)
+    })
 }
 
 /// Recursively shift every span dict's `start`/`end` by `chunk.start_char`
 /// and recompute `text` against the original document.
-fn remap_spans(value: Value, chunk_start_char: usize, char_offsets: &[usize], original_text: &str) -> Value {
+fn remap_spans(
+    value: Value,
+    chunk_start_char: usize,
+    char_offsets: &[usize],
+    original_text: &str,
+) -> Value {
     match value {
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(|v| remap_spans(v, chunk_start_char, char_offsets, original_text)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| remap_spans(v, chunk_start_char, char_offsets, original_text))
+                .collect(),
+        ),
         Value::Object(map) => {
-            let mut remapped: Map<String, Value> =
-                map.into_iter().map(|(k, v)| (k, remap_spans(v, chunk_start_char, char_offsets, original_text))).collect();
+            let mut remapped: Map<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        remap_spans(v, chunk_start_char, char_offsets, original_text),
+                    )
+                })
+                .collect();
             if is_span_value(&Value::Object(remapped.clone())) {
                 let start = remapped["start"].as_u64().unwrap() as usize + chunk_start_char;
                 let end = remapped["end"].as_u64().unwrap() as usize + chunk_start_char;
                 remapped.insert("start".into(), Value::from(start));
                 remapped.insert("end".into(), Value::from(end));
                 if start <= end && end < char_offsets.len() {
-                    remapped.insert("text".into(), Value::from(&original_text[char_offsets[start]..char_offsets[end]]));
+                    remapped.insert(
+                        "text".into(),
+                        Value::from(&original_text[char_offsets[start]..char_offsets[end]]),
+                    );
                 }
             }
             Value::Object(remapped)
@@ -107,11 +145,75 @@ fn as_list(v: &Value) -> Vec<Value> {
 }
 
 fn is_classification_dict(v: &Value) -> bool {
-    v.as_object().is_some_and(|m| m.contains_key("label") && m.contains_key("confidence"))
+    v.as_object()
+        .is_some_and(|m| m.contains_key("label") && m.contains_key("confidence"))
 }
 
 fn confidence_of(v: &Value) -> f64 {
     v.get("confidence").and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+// Dedupe relation items
+fn dedupe_relation_items(items: Vec<Value>, policy: OverlapPolicy) -> Vec<Value> {
+    if items.is_empty() {
+        return items;
+    }
+
+    struct Cand {
+        idx: usize,
+        head: (usize, usize),
+        tail: (usize, usize),
+        score: f32,
+    }
+
+    fn span_of(v: &Value, side: &str) -> Option<(usize, usize)> {
+        Some((
+            v[side]["start"].as_u64()? as usize,
+            v[side]["end"].as_u64()? as usize,
+        ))
+    }
+    fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+        a.0 < b.1 && b.0 < a.1
+    }
+
+    let mut cands: Vec<Cand> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, v)| {
+            Some(Cand {
+                idx,
+                head: span_of(v, "head")?,
+                tail: span_of(v, "tail")?,
+                score: confidence_of(v) as f32, // see question 3 below
+            })
+        })
+        .collect();
+
+    // best score first; earlier item wins ties
+    cands.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.idx.cmp(&b.idx))
+    });
+
+    let mut kept: Vec<&Cand> = Vec::new();
+    for c in &cands {
+        let conflict = kept.iter().any(|k| {
+            if matches!(policy, OverlapPolicy::Disallow) {
+                overlaps(k.head, c.head) && overlaps(k.tail, c.tail)
+            } else {
+                k.head == c.head && k.tail == c.tail
+            }
+        });
+        if !conflict {
+            kept.push(c);
+        }
+    }
+
+    let mut out: Vec<Value> = kept.iter().map(|k| items[k.idx].clone()).collect();
+    out.sort_by_key(|v| (span_of(v, "head"), span_of(v, "tail")));
+    out
 }
 
 /// Dedupe span dicts across chunk overlaps: exact-boundary duplicates keep
@@ -134,15 +236,26 @@ fn dedupe_span_items(items: Vec<Value>, policy: OverlapPolicy) -> Vec<Value> {
     let mut out = Vec::with_capacity(selected.len());
     for sel in selected {
         if let Some(idx) = (0..items.len()).find(|&i| {
-            !used[i] && scored[i].start == sel.start && scored[i].end == sel.end && scored[i].score == sel.score
+            !used[i]
+                && scored[i].start == sel.start
+                && scored[i].end == sel.end
+                && scored[i].score == sel.score
         }) {
             used[idx] = true;
             out.push(items[idx].clone());
         }
     }
     out.sort_by(|a, b| {
-        (a["start"].as_u64(), a["end"].as_u64(), a.get("text").and_then(Value::as_str).unwrap_or(""))
-            .cmp(&(b["start"].as_u64(), b["end"].as_u64(), b.get("text").and_then(Value::as_str).unwrap_or("")))
+        (
+            a["start"].as_u64(),
+            a["end"].as_u64(),
+            a.get("text").and_then(Value::as_str).unwrap_or(""),
+        )
+            .cmp(&(
+                b["start"].as_u64(),
+                b["end"].as_u64(),
+                b.get("text").and_then(Value::as_str).unwrap_or(""),
+            ))
     });
     out
 }
@@ -153,8 +266,11 @@ fn dedupe_span_items(items: Vec<Value>, policy: OverlapPolicy) -> Vec<Value> {
 fn canonical_key(v: &Value) -> String {
     match v {
         Value::Object(m) => {
-            let mut pairs: Vec<(String, String)> =
-                m.iter().filter(|(k, _)| k.as_str() != "confidence").map(|(k, v)| (k.clone(), canonical_key(v))).collect();
+            let mut pairs: Vec<(String, String)> = m
+                .iter()
+                .filter(|(k, _)| k.as_str() != "confidence")
+                .map(|(k, v)| (k.clone(), canonical_key(v)))
+                .collect();
             pairs.sort();
             format!("{pairs:?}")
         }
@@ -167,7 +283,10 @@ fn representative_confidence(v: &Value) -> f64 {
     match v {
         Value::Object(m) => match m.get("confidence").and_then(Value::as_f64) {
             Some(c) => c,
-            None => m.values().map(representative_confidence).fold(0.0, f64::max),
+            None => m
+                .values()
+                .map(representative_confidence)
+                .fold(0.0, f64::max),
         },
         Value::Array(a) => a.iter().map(representative_confidence).fold(0.0, f64::max),
         _ => 0.0,
@@ -195,26 +314,37 @@ fn dedupe_other_items(items: Vec<Value>) -> Vec<Value> {
 }
 
 fn dedupe_items(items: Vec<Value>, policy: OverlapPolicy) -> Vec<Value> {
-    let (span_items, other_items): (Vec<Value>, Vec<Value>) = items.into_iter().partition(is_span_value);
+    let (span_items, other_items): (Vec<Value>, Vec<Value>) =
+        items.into_iter().partition(is_span_value);
     let mut out = dedupe_span_items(span_items, policy);
     out.extend(dedupe_other_items(other_items));
     out
 }
 
 fn is_empty_value(v: &Value) -> bool {
-    matches!(v, Value::Null) || matches!(v, Value::Object(m) if m.is_empty()) || matches!(v, Value::Array(a) if a.is_empty())
+    matches!(v, Value::Null)
+        || matches!(v, Value::Object(m) if m.is_empty())
+        || matches!(v, Value::Array(a) if a.is_empty())
 }
 
 /// Generic merge for one non-`entities`/`relation_extraction` field, shared
 /// by classification results, structure instance lists, and nested dicts.
 fn merge_values(values: &[&Value], policy: OverlapPolicy) -> Value {
-    let non_empty: Vec<&Value> = values.iter().copied().filter(|v| !is_empty_value(v)).collect();
+    let non_empty: Vec<&Value> = values
+        .iter()
+        .copied()
+        .filter(|v| !is_empty_value(v))
+        .collect();
     if non_empty.is_empty() {
         return values.first().map(|v| (*v).clone()).unwrap_or(Value::Null);
     }
 
     if non_empty.iter().all(|v| is_classification_dict(v)) {
-        return (*non_empty.iter().max_by(|a, b| confidence_of(a).total_cmp(&confidence_of(b))).unwrap()).clone();
+        return (*non_empty
+            .iter()
+            .max_by(|a, b| confidence_of(a).total_cmp(&confidence_of(b)))
+            .unwrap())
+        .clone();
     }
 
     if non_empty.iter().all(|v| v.is_string()) {
@@ -262,13 +392,20 @@ fn merge_nested_dicts(values: &[&Value], policy: OverlapPolicy) -> Value {
     }
     let mut merged = Map::new();
     for key in keys {
-        let per_key: Vec<&Value> = values.iter().filter_map(|v| v.as_object().and_then(|m| m.get(&key))).collect();
+        let per_key: Vec<&Value> = values
+            .iter()
+            .filter_map(|v| v.as_object().and_then(|m| m.get(&key)))
+            .collect();
         merged.insert(key, merge_values(&per_key, policy));
     }
     Value::Object(merged)
 }
 
-fn merge_entity_maps(values: &[&Value], scalar_labels: &std::collections::HashSet<String>, policy: OverlapPolicy) -> Value {
+fn merge_entity_maps(
+    values: &[&Value],
+    scalar_labels: &std::collections::HashSet<String>,
+    policy: OverlapPolicy,
+) -> Value {
     let mut labels: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for v in values {
@@ -288,7 +425,15 @@ fn merge_entity_maps(values: &[&Value], scalar_labels: &std::collections::HashSe
                 items.extend(as_list(entry));
             }
         }
-        let deduped = dedupe_span_items(items, policy);
+        let is_relation = items.first().map_or(false, |v| {
+            v.get("head").is_some() && v.get("tail").is_some()
+        });
+        let deduped = if is_relation {
+            dedupe_relation_items(items, policy)
+        } else {
+            dedupe_span_items(items, policy)
+        };
+
         if scalar_labels.contains(&label) {
             out.insert(label, deduped.into_iter().next().unwrap_or(Value::Null));
         } else {
@@ -320,14 +465,21 @@ fn merge_relation_maps(values: &[&Value]) -> Value {
         }
         // Relations are always merged with "allow": chunk overlap only ever
         // produces exact re-detections, never genuine crossings to resolve.
-        out.insert(label, Value::Array(dedupe_span_items(items, OverlapPolicy::Allow)));
+        out.insert(
+            label,
+            Value::Array(dedupe_relation_items(items, OverlapPolicy::Allow)),
+        );
     }
     Value::Object(out)
 }
 
 /// Merge one document's already span-remapped chunk results into a single
 /// result, mirroring `gliner2.inference.chunking.merge_chunk_results`.
-pub fn merge_chunk_results(results: Vec<Value>, scalar_entity_labels: &std::collections::HashSet<String>, policy: OverlapPolicy) -> Value {
+pub fn merge_chunk_results(
+    results: Vec<Value>,
+    scalar_entity_labels: &std::collections::HashSet<String>,
+    policy: OverlapPolicy,
+) -> Value {
     let mut keys: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for r in &results {
@@ -341,7 +493,10 @@ pub fn merge_chunk_results(results: Vec<Value>, scalar_entity_labels: &std::coll
     }
     let mut merged = Map::new();
     for key in keys {
-        let values: Vec<&Value> = results.iter().filter_map(|r| r.as_object().and_then(|m| m.get(&key))).collect();
+        let values: Vec<&Value> = results
+            .iter()
+            .filter_map(|r| r.as_object().and_then(|m| m.get(&key)))
+            .collect();
         let merged_value = if key == "entities" {
             merge_entity_maps(&values, scalar_entity_labels, policy)
         } else if key == "relation_extraction" {
@@ -360,15 +515,27 @@ const SPAN_RESERVED: [&str; 4] = ["text", "confidence", "start", "end"];
 /// caller didn't ask for, mirroring `_strip_span_metadata`.
 pub fn strip_span_metadata(value: Value, include_confidence: bool, include_spans: bool) -> Value {
     match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(|v| strip_span_metadata(v, include_confidence, include_spans)).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| strip_span_metadata(v, include_confidence, include_spans))
+                .collect(),
+        ),
         Value::Object(map) => {
             if is_span_value(&Value::Object(map.clone())) {
-                let extras: Map<String, Value> = map.iter().filter(|(k, _)| !SPAN_RESERVED.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+                let extras: Map<String, Value> = map
+                    .iter()
+                    .filter(|(k, _)| !SPAN_RESERVED.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 if !include_confidence && !include_spans && extras.is_empty() {
                     return map.get("text").cloned().unwrap_or(Value::from(""));
                 }
                 let mut stripped = Map::new();
-                stripped.insert("text".to_string(), map.get("text").cloned().unwrap_or(Value::from("")));
+                stripped.insert(
+                    "text".to_string(),
+                    map.get("text").cloned().unwrap_or(Value::from("")),
+                );
                 if include_confidence {
                     if let Some(c) = map.get("confidence") {
                         stripped.insert("confidence".to_string(), c.clone());
@@ -392,7 +559,11 @@ pub fn strip_span_metadata(value: Value, include_confidence: bool, include_spans
                 };
             }
 
-            if map.contains_key("text") && map.contains_key("confidence") && !map.contains_key("start") && !map.contains_key("end") {
+            if map.contains_key("text")
+                && map.contains_key("confidence")
+                && !map.contains_key("start")
+                && !map.contains_key("end")
+            {
                 return if include_confidence {
                     Value::Object(map)
                 } else {
@@ -400,7 +571,11 @@ pub fn strip_span_metadata(value: Value, include_confidence: bool, include_spans
                 };
             }
 
-            Value::Object(map.into_iter().map(|(k, v)| (k, strip_span_metadata(v, include_confidence, include_spans))).collect())
+            Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, strip_span_metadata(v, include_confidence, include_spans)))
+                    .collect(),
+            )
         }
         other => other,
     }
@@ -424,5 +599,9 @@ pub fn extract_chunked(
         remapped.push(remap_spans(result, chunk.start_char, &char_offsets, text));
     }
     let merged = merge_chunk_results(remapped, scalar_entity_labels, overlap_policy);
-    Ok(strip_span_metadata(merged, include_confidence, include_spans))
+    Ok(strip_span_metadata(
+        merged,
+        include_confidence,
+        include_spans,
+    ))
 }

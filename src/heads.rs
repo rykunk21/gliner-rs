@@ -8,6 +8,7 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 
 use crate::config::BoundaryHeadConfig;
+use crate::timing::timed_block;
 
 /// Finite masking sentinel (`gliner2.models.boundary.constants.MASK_LOGIT`).
 pub const MASK_LOGIT: f32 = -1.0e4;
@@ -56,12 +57,17 @@ struct BoundaryAttentionBlock {
 impl BoundaryAttentionBlock {
     fn forward(&self, states: &Tensor, bias: &Tensor) -> Result<Tensor> {
         let n = states.dim(0)?;
-        let qkv = self
-            .qkv
-            .forward(&self.norm.forward(states)?)?
-            .reshape((n, 3, self.heads, self.head_dim))?;
+        let qkv = self.qkv.forward(&self.norm.forward(states)?)?.reshape((
+            n,
+            3,
+            self.heads,
+            self.head_dim,
+        ))?;
         let part = |i: usize| -> Result<Tensor> {
-            qkv.narrow(1, i, 1)?.squeeze(1)?.transpose(0, 1)?.contiguous()
+            qkv.narrow(1, i, 1)?
+                .squeeze(1)?
+                .transpose(0, 1)?
+                .contiguous()
         };
         let (q, k, v) = (part(0)?, part(1)?, part(2)?);
         let scores = q
@@ -144,14 +150,21 @@ impl BoundaryEncoder {
     }
 
     /// `text`: `[n, H]` -> boundary states `[n + 1, d]`.
+    #[tracing::instrument(skip(self, text), fields(n = text.dim(0).unwrap_or(0)))]
     fn forward(&self, text: &Tensor) -> Result<Tensor> {
+        let _t = timed_block("BoundaryEncoder::forward");
         let left = Tensor::cat(&[&self.bos_state.unsqueeze(0)?, text], 0)?;
         let right = Tensor::cat(&[text, &self.eos_state.unsqueeze(0)?], 0)?;
         let joined = Tensor::cat(
-            &[&self.left_projection.forward(&left)?, &self.right_projection.forward(&right)?],
+            &[
+                &self.left_projection.forward(&left)?,
+                &self.right_projection.forward(&right)?,
+            ],
             1,
         )?;
-        let mut states = self.layer_norm.forward(&self.output_projection.forward(&joined)?)?;
+        let mut states = self
+            .layer_norm
+            .forward(&self.output_projection.forward(&joined)?)?;
         if !self.attention_blocks.is_empty() {
             let n = states.dim(0)?;
             let mut bias = vec![0f32; n * n];
@@ -210,7 +223,9 @@ impl BoundaryQueryHead {
         })
     }
 
+    #[tracing::instrument(skip(self, boundary, text, query))]
     fn forward(&self, boundary: &Tensor, text: &Tensor, query: &Tensor) -> Result<Marginals> {
+        let _t = timed_block("BoundaryQueryHead::forward");
         let score = |q: &Linear, k: &Linear, keys: &Tensor| -> Result<Vec<Vec<f32>>> {
             let logits = q
                 .forward(query)?
@@ -237,7 +252,12 @@ impl BoundaryQueryHead {
             inside_prefix.push(prefix);
             inside_mean.push(mean);
         }
-        Ok(Marginals { start, end, inside_prefix, inside_mean })
+        Ok(Marginals {
+            start,
+            end,
+            inside_prefix,
+            inside_mean,
+        })
     }
 }
 
@@ -267,7 +287,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl DocumentCandidatePool {
+    #[tracing::instrument(skip(self, boundary, marginals))]
     fn build(&self, boundary: &Tensor, marginals: &Marginals) -> Result<Vec<PooledCandidate>> {
+        let _t = timed_block("DocumentCandidatePool::build");
         let n = boundary.dim(0)?;
         let q = marginals.start.len();
         let start_all = tensor_to_vec2(&self.start_projection.forward(boundary)?)?;
@@ -312,7 +334,9 @@ impl DocumentCandidatePool {
                 let per_query: Vec<f32> = (0..pairs)
                     .map(|p| {
                         if pair_valid[p] {
-                            marginals.start[qi][pair_s[p]] + marginals.end[qi][pair_e[p]] + compat[p]
+                            marginals.start[qi][pair_s[p]]
+                                + marginals.end[qi][pair_e[p]]
+                                + compat[p]
                         } else {
                             MASK_LOGIT
                         }
@@ -336,7 +360,11 @@ impl DocumentCandidatePool {
             .into_iter()
             .map(|key| {
                 let (start, end) = (key / n, key % n);
-                PooledCandidate { start, end, compat: dot(&start_all[start], &end_all[end]) * inv_sqrt_d }
+                PooledCandidate {
+                    start,
+                    end,
+                    compat: dot(&start_all[start], &end_all[end]) * inv_sqrt_d,
+                }
             })
             .collect())
     }
@@ -344,10 +372,24 @@ impl DocumentCandidatePool {
 
 /// `_deduplicate_pool`: keep the best-scored occurrence of every key and return
 /// up to `capacity` valid keys ordered by score (ties by ascending key).
-fn deduplicate_pool(keys: &[usize], scores: &[f32], valid: &[bool], capacity: usize, n: usize) -> Vec<usize> {
+fn deduplicate_pool(
+    keys: &[usize],
+    scores: &[f32],
+    valid: &[bool],
+    capacity: usize,
+    n: usize,
+) -> Vec<usize> {
     let invalid_key = n * n;
-    let keys: Vec<usize> = keys.iter().zip(valid).map(|(&k, &v)| if v { k } else { invalid_key }).collect();
-    let scores: Vec<f32> = scores.iter().zip(valid).map(|(&s, &v)| if v { s } else { MASK_LOGIT }).collect();
+    let keys: Vec<usize> = keys
+        .iter()
+        .zip(valid)
+        .map(|(&k, &v)| if v { k } else { invalid_key })
+        .collect();
+    let scores: Vec<f32> = scores
+        .iter()
+        .zip(valid)
+        .map(|(&s, &v)| if v { s } else { MASK_LOGIT })
+        .collect();
     // Score-descending, then stably key-ascending: the first row of each key
     // group is its best-scored occurrence.
     let mut order = argsort_desc(&scores);
@@ -399,10 +441,21 @@ impl SharedPoolScorer {
         let p = cfg.pair_dim;
         let content = if cfg.enable_span_content {
             let pooler = SpanContentPooler {
-                value_projection: linear(hidden, cfg.content_dim, vb.pp("content_pooler.value_projection"))?,
-                layer_norm: layer_norm(cfg.content_dim, TORCH_LN_EPS, vb.pp("content_pooler.layer_norm"))?,
+                value_projection: linear(
+                    hidden,
+                    cfg.content_dim,
+                    vb.pp("content_pooler.value_projection"),
+                )?,
+                layer_norm: layer_norm(
+                    cfg.content_dim,
+                    TORCH_LN_EPS,
+                    vb.pp("content_pooler.layer_norm"),
+                )?,
             };
-            Some((pooler, linear(cfg.content_dim, p, vb.pp("content_projection"))?))
+            Some((
+                pooler,
+                linear(cfg.content_dim, p, vb.pp("content_projection"))?,
+            ))
         } else {
             None
         };
@@ -422,6 +475,7 @@ impl SharedPoolScorer {
     }
 
     /// Returns the learned part of the pair score, `[C, Q]`.
+    #[tracing::instrument(skip(self, boundary, text, query, candidates))]
     fn forward(
         &self,
         boundary: &Tensor,
@@ -429,14 +483,21 @@ impl SharedPoolScorer {
         query: &Tensor,
         candidates: &[PooledCandidate],
     ) -> Result<Vec<Vec<f32>>> {
+        let _t = timed_block("SharedPoolScorer::forward");
         let device = boundary.device();
         let c = candidates.len();
         let n_words = text.dim(0)?;
         let s_idx = u32_tensor(candidates.iter().map(|x| x.start), device)?;
         let e_idx = u32_tensor(candidates.iter().map(|x| x.end), device)?;
 
-        let start_rep = self.start_projection.forward(boundary)?.index_select(&s_idx, 0)?;
-        let end_rep = self.end_projection.forward(boundary)?.index_select(&e_idx, 0)?;
+        let start_rep = self
+            .start_projection
+            .forward(boundary)?
+            .index_select(&s_idx, 0)?;
+        let end_rep = self
+            .end_projection
+            .forward(boundary)?
+            .index_select(&e_idx, 0)?;
         let tl = n_words.max(1) as f32;
         let mut length_features = Vec::with_capacity(c * 3);
         let mut lengths = Vec::with_capacity(c);
@@ -446,9 +507,14 @@ impl SharedPoolScorer {
             lengths.push(length);
         }
         let length_features = Tensor::from_vec(length_features, (c, 3), device)?;
-        let prior = Tensor::from_vec(candidates.iter().map(|x| x.compat).collect::<Vec<_>>(), (c, 1), device)?;
+        let prior = Tensor::from_vec(
+            candidates.iter().map(|x| x.compat).collect::<Vec<_>>(),
+            (c, 1),
+            device,
+        )?;
 
-        let mut candidate = (((start_rep + end_rep)? + self.length_projection.forward(&length_features)?)?
+        let mut candidate = (((start_rep + end_rep)?
+            + self.length_projection.forward(&length_features)?)?
             + self.prior_projection.forward(&prior)?)?;
 
         if let Some((pooler, projection)) = &self.content {
@@ -503,10 +569,13 @@ fn rotate(states: &mut [f32], position: usize, base: f32) {
 
 /// `sigmoid(gate)` repeated element-wise twice (`repeat_interleave(2)`).
 fn interleaved_gate(logits: &[f32]) -> Vec<f32> {
-    logits.iter().flat_map(|&x| {
-        let g = 1.0 / (1.0 + (-x).exp());
-        [g, g]
-    }).collect()
+    logits
+        .iter()
+        .flat_map(|&x| {
+            let g = 1.0 / (1.0 + (-x).exp());
+            [g, g]
+        })
+        .collect()
 }
 
 /// `SparseBoundaryProposer.score_explicit_pairs` weights (marginal-free prior).
@@ -543,7 +612,11 @@ impl PairScorer {
             query_gate: linear(hidden, p / 2, vb.pp("query_gate"))?,
             length_query_projection: linear(hidden, 3, vb.pp("length_query_projection"))?,
             inside_weight: linear(hidden, 1, vb.pp("inside_weight"))?,
-            endpoint_difference_projection: linear(2 * p, 1, vb.pp("endpoint_difference_projection"))?,
+            endpoint_difference_projection: linear(
+                2 * p,
+                1,
+                vb.pp("endpoint_difference_projection"),
+            )?,
             content_value_projection: linear(hidden, c, vb.pp("content_pooler.value_projection"))?,
             content_layer_norm: layer_norm(c, TORCH_LN_EPS, vb.pp("content_pooler.layer_norm"))?,
             content_query_projection: linear(hidden, c, vb.pp("content_query_projection"))?,
@@ -618,9 +691,17 @@ impl BoundaryHead {
                 None
             },
             proposer: ExplicitProposer {
-                start_pair_projection: linear(d, d, vb.pp("boundary_proposer.start_pair_projection"))?,
+                start_pair_projection: linear(
+                    d,
+                    d,
+                    vb.pp("boundary_proposer.start_pair_projection"),
+                )?,
                 end_key_projection: linear(d, d, vb.pp("boundary_proposer.end_key_projection"))?,
-                start_query_projection: linear(hidden, d / 2, vb.pp("boundary_proposer.start_query_projection"))?,
+                start_query_projection: linear(
+                    hidden,
+                    d / 2,
+                    vb.pp("boundary_proposer.start_query_projection"),
+                )?,
             },
             pair_scorer: PairScorer::load(vb.pp("pair_scorer"), hidden, cfg)?,
             use_inside_evidence: cfg.use_inside_evidence,
@@ -630,7 +711,9 @@ impl BoundaryHead {
     }
 
     /// `text`: `[n, H]` word states (n >= 1), `query`: `[Q, H]` (Q >= 1).
+    #[tracing::instrument(skip(self, text, query), fields(n = text.dim(0).unwrap_or(0), q = query.dim(0).unwrap_or(0)))]
     pub fn forward(&self, text: &Tensor, query: &Tensor) -> Result<BoundaryForward> {
+        let _t = timed_block("BoundaryHead::forward");
         let boundary = self.boundary_encoder.forward(text)?;
         let marginals = self.query_head.forward(&boundary, text, query)?;
         let pooled = self.pool.build(&boundary, &marginals)?;
@@ -654,7 +737,12 @@ impl BoundaryHead {
         }
 
         let null_logits = match &self.null_projection {
-            Some(proj) => Some(proj.forward(query)?.squeeze(1)?.to_dtype(DType::F32)?.to_vec1::<f32>()?),
+            Some(proj) => Some(
+                proj.forward(query)?
+                    .squeeze(1)?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?,
+            ),
             None => None,
         };
         Ok(BoundaryForward {
@@ -679,14 +767,20 @@ impl BoundaryHead {
 
     /// Record-head candidate states `[C, H]` (`candidate_encoder(cat(start, end))`).
     pub fn candidate_states(&self, fwd: &BoundaryForward) -> Result<Option<Tensor>> {
-        let Some(encoder) = &self.candidate_encoder else { return Ok(None) };
+        let Some(encoder) = &self.candidate_encoder else {
+            return Ok(None);
+        };
         let spans = &fwd.scores.spans;
         if spans.is_empty() {
             return Ok(None);
         }
         let device = fwd.boundary.device();
-        let starts = fwd.boundary.index_select(&u32_tensor(spans.iter().map(|s| s.0), device)?, 0)?;
-        let ends = fwd.boundary.index_select(&u32_tensor(spans.iter().map(|s| s.1), device)?, 0)?;
+        let starts = fwd
+            .boundary
+            .index_select(&u32_tensor(spans.iter().map(|s| s.0), device)?, 0)?;
+        let ends = fwd
+            .boundary
+            .index_select(&u32_tensor(spans.iter().map(|s| s.1), device)?, 0)?;
         Ok(Some(encoder.forward(&Tensor::cat(&[&starts, &ends], 1)?)?))
     }
 
@@ -714,7 +808,10 @@ impl BoundaryHead {
         let b_start = fwd.boundary.index_select(&s_idx, 0)?;
         let b_end = fwd.boundary.index_select(&e_idx, 0)?;
 
-        let rotated = |proj: &Linear, states: &Tensor, positions: &mut dyn Iterator<Item = usize>| -> Result<Vec<Vec<f32>>> {
+        let rotated = |proj: &Linear,
+                       states: &Tensor,
+                       positions: &mut dyn Iterator<Item = usize>|
+         -> Result<Vec<Vec<f32>>> {
             let mut rows = tensor_to_vec2(&proj.forward(states)?)?;
             for (row, pos) in rows.iter_mut().zip(positions) {
                 rotate(row, pos, self.rotary_base);
@@ -725,15 +822,31 @@ impl BoundaryHead {
 
         // Proposal prior (marginal-free compatibility).
         let prop = &self.proposer;
-        let ps = rotated(&prop.start_pair_projection, &b_start, &mut spans.iter().map(|s| clamp(s.0)))?;
-        let pe = rotated(&prop.end_key_projection, &b_end, &mut spans.iter().map(|s| clamp(s.1)))?;
+        let ps = rotated(
+            &prop.start_pair_projection,
+            &b_start,
+            &mut spans.iter().map(|s| clamp(s.0)),
+        )?;
+        let pe = rotated(
+            &prop.end_key_projection,
+            &b_end,
+            &mut spans.iter().map(|s| clamp(s.1)),
+        )?;
         let prop_gate = interleaved_gate(&row_vec(prop.start_query_projection.forward(&q_row)?)?);
         let inv_sqrt_d = 1.0 / (self.boundary_dim as f32).sqrt();
 
         // Reranker endpoints.
         let ps_ = &self.pair_scorer;
-        let ss = rotated(&ps_.start_endpoint_projection, &b_start, &mut spans.iter().map(|s| clamp(s.0)))?;
-        let se = rotated(&ps_.end_endpoint_projection, &b_end, &mut spans.iter().map(|s| clamp(s.1)))?;
+        let ss = rotated(
+            &ps_.start_endpoint_projection,
+            &b_start,
+            &mut spans.iter().map(|s| clamp(s.0)),
+        )?;
+        let se = rotated(
+            &ps_.end_endpoint_projection,
+            &b_end,
+            &mut spans.iter().map(|s| clamp(s.1)),
+        )?;
         let gate = interleaved_gate(&row_vec(ps_.query_gate.forward(&q_row)?)?);
         let p = ps_.pair_dim;
         let head_width = p / ps_.compat_heads;
@@ -744,26 +857,51 @@ impl BoundaryHead {
         for i in 0..c {
             for h in 0..ps_.compat_heads {
                 let lo = h * head_width;
-                per_head.push((lo..lo + head_width).map(|k| ss[i][k] * gate[k] * se[i][k]).sum::<f32>());
+                per_head.push(
+                    (lo..lo + head_width)
+                        .map(|k| ss[i][k] * gate[k] * se[i][k])
+                        .sum::<f32>(),
+                );
             }
             difference.extend((0..p).map(|k| ss[i][k] - se[i][k]));
             difference.extend((0..p).map(|k| (ss[i][k] - se[i][k]).abs()));
-            prior.push((0..self.boundary_dim).map(|k| ps[i][k] * prop_gate[k] * pe[i][k]).sum::<f32>() * inv_sqrt_d);
+            prior.push(
+                (0..self.boundary_dim)
+                    .map(|k| ps[i][k] * prop_gate[k] * pe[i][k])
+                    .sum::<f32>()
+                    * inv_sqrt_d,
+            );
         }
         let per_head = Tensor::from_vec(per_head, (c, ps_.compat_heads), device)?;
-        let compat = ps_.compat_mix.forward(&per_head)?.squeeze(1)?.to_vec1::<f32>()?;
+        let compat = ps_
+            .compat_mix
+            .forward(&per_head)?
+            .squeeze(1)?
+            .to_vec1::<f32>()?;
         let difference = Tensor::from_vec(difference, (c, 2 * p), device)?;
-        let difference = ps_.endpoint_difference_projection.forward(&difference)?.squeeze(1)?.to_vec1::<f32>()?;
+        let difference = ps_
+            .endpoint_difference_projection
+            .forward(&difference)?
+            .squeeze(1)?
+            .to_vec1::<f32>()?;
 
         // Span content.
         let values = ps_.content_value_projection.forward(text)?;
         let zeros = Tensor::zeros((1, values.dim(1)?), DType::F32, device)?;
         let prefix = Tensor::cat(&[&zeros, &values.cumsum(0)?], 0)?;
-        let lengths: Vec<f32> = spans.iter().map(|s| s.1.saturating_sub(s.0).max(1) as f32).collect();
+        let lengths: Vec<f32> = spans
+            .iter()
+            .map(|s| s.1.saturating_sub(s.0).max(1) as f32)
+            .collect();
         let length_t = Tensor::from_vec(lengths.clone(), (c, 1), device)?;
-        let content = (prefix.index_select(&e_idx, 0)? - prefix.index_select(&s_idx, 0)?)?.broadcast_div(&length_t)?;
+        let content = (prefix.index_select(&e_idx, 0)? - prefix.index_select(&s_idx, 0)?)?
+            .broadcast_div(&length_t)?;
         let content = ps_.content_layer_norm.forward(&content)?;
-        let content_bias = ps_.content_bias.forward(&content)?.squeeze(1)?.to_vec1::<f32>()?;
+        let content_bias = ps_
+            .content_bias
+            .forward(&content)?
+            .squeeze(1)?
+            .to_vec1::<f32>()?;
         let content = tensor_to_vec2(&content)?;
         let coefficient = row_vec(ps_.content_query_projection.forward(&q_row)?)?;
         let content_scale = 1.0 / (coefficient.len() as f32).sqrt();
@@ -779,16 +917,26 @@ impl BoundaryHead {
                 let (s, e) = (clamp(spans[i].0), clamp(spans[i].1));
                 let mut score = compat[i] * inv_sqrt_p + difference[i];
                 score += m.start[query_index][s] + m.end[query_index][e] + prior[i];
-                score += content[i].iter().zip(&coefficient).map(|(a, b)| a * b).sum::<f32>() * content_scale;
+                score += content[i]
+                    .iter()
+                    .zip(&coefficient)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    * content_scale;
                 score += content_bias[i];
                 if self.use_inside_evidence {
                     let pre = &m.inside_prefix[query_index];
-                    let interval = pre[e] - pre[s] + m.inside_mean[query_index] * (e as f32 - s as f32);
+                    let interval =
+                        pre[e] - pre[s] + m.inside_mean[query_index] * (e as f32 - s as f32);
                     score += inside_weight * (interval / lengths[i].sqrt());
                 }
                 let len = lengths[i];
                 let feats = [len.ln_1p(), len / tl, 1.0 / len.sqrt()];
-                score += feats.iter().zip(&length_coeff).map(|(a, b)| a * b).sum::<f32>();
+                score += feats
+                    .iter()
+                    .zip(&length_coeff)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>();
                 score
             })
             .collect())
@@ -823,7 +971,9 @@ impl Classifier {
     }
 
     /// `states`: `[K, H]` label-marker states -> `K` logits.
+    #[tracing::instrument(skip(self, states))]
     pub fn forward(&self, states: &Tensor) -> Result<Vec<f32>> {
+        let _t = timed_block("Classifier::forward");
         self.output
             .forward(&self.hidden.forward(states)?.relu()?)?
             .squeeze(1)?
@@ -849,8 +999,18 @@ struct TwoLayerMlp {
 }
 
 impl TwoLayerMlp {
-    fn load(vb: VarBuilder, in_dim: usize, hidden_dim: usize, out_dim: usize, idx1: &str, idx2: &str) -> Result<Self> {
-        Ok(Self { hidden: linear(in_dim, hidden_dim, vb.pp(idx1))?, output: linear(hidden_dim, out_dim, vb.pp(idx2))? })
+    fn load(
+        vb: VarBuilder,
+        in_dim: usize,
+        hidden_dim: usize,
+        out_dim: usize,
+        idx1: &str,
+        idx2: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            hidden: linear(in_dim, hidden_dim, vb.pp(idx1))?,
+            output: linear(hidden_dim, out_dim, vb.pp(idx2))?,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -863,12 +1023,23 @@ pub struct CountPred(TwoLayerMlp);
 
 impl CountPred {
     pub fn load(vb: VarBuilder, hidden: usize) -> Result<Self> {
-        Ok(Self(TwoLayerMlp::load(vb, hidden, 2 * hidden, 20, "0", "2")?))
+        Ok(Self(TwoLayerMlp::load(
+            vb,
+            hidden,
+            2 * hidden,
+            20,
+            "0",
+            "2",
+        )?))
     }
 
     /// `prompt_state`: `[H]` -> the predicted count (argmax over 20 classes, capped at 19).
     pub fn predict(&self, prompt_state: &Tensor) -> Result<usize> {
-        let logits = self.0.forward(&prompt_state.unsqueeze(0)?)?.squeeze(0)?.to_vec1::<f32>()?;
+        let logits = self
+            .0
+            .forward(&prompt_state.unsqueeze(0)?)?
+            .squeeze(0)?
+            .to_vec1::<f32>()?;
         Ok(argmax(&logits))
     }
 }
@@ -880,11 +1051,11 @@ impl CountPred {
 /// row 0, not on how many steps the caller asks for, so it's enough to run
 /// exactly one GRU step here instead of reproducing the full unroll.
 pub struct CountLstmStep0 {
-    pos0: Tensor,   // `pos_embedding.weight[0]`, `[H]`
-    w_ih: Tensor,   // `[3H, H]`
-    w_hh: Tensor,   // `[3H, H]`
-    b_ih: Tensor,   // `[3H]`
-    b_hh: Tensor,   // `[3H]`
+    pos0: Tensor, // `pos_embedding.weight[0]`, `[H]`
+    w_ih: Tensor, // `[3H, H]`
+    w_hh: Tensor, // `[3H, H]`
+    b_ih: Tensor, // `[3H]`
+    b_hh: Tensor, // `[3H]`
     projector: TwoLayerMlp,
     hidden: usize,
 }
@@ -900,7 +1071,14 @@ impl CountLstmStep0 {
             w_hh: gru.get((3 * hidden, hidden), "weight_hh_l0")?,
             b_ih: gru.get(3 * hidden, "bias_ih_l0")?,
             b_hh: gru.get(3 * hidden, "bias_hh_l0")?,
-            projector: TwoLayerMlp::load(vb.pp("projector"), 2 * hidden, 4 * hidden, hidden, "0", "2")?,
+            projector: TwoLayerMlp::load(
+                vb.pp("projector"),
+                2 * hidden,
+                4 * hidden,
+                hidden,
+                "0",
+                "2",
+            )?,
             hidden,
         })
     }
@@ -910,9 +1088,12 @@ impl CountLstmStep0 {
     pub fn forward(&self, field_states: &Tensor) -> Result<Tensor> {
         let m = field_states.dim(0)?;
         let pos_seq = self.pos0.unsqueeze(0)?.broadcast_as((m, self.hidden))?;
-        let gi = (pos_seq.matmul(&self.w_ih.t()?)? + self.b_ih.broadcast_as((m, 3 * self.hidden))?)?;
-        let gh = (field_states.matmul(&self.w_hh.t()?)? + self.b_hh.broadcast_as((m, 3 * self.hidden))?)?;
-        let chunk = |t: &Tensor, i: usize| -> Result<Tensor> { t.narrow(1, i * self.hidden, self.hidden) };
+        let gi =
+            (pos_seq.matmul(&self.w_ih.t()?)? + self.b_ih.broadcast_as((m, 3 * self.hidden))?)?;
+        let gh = (field_states.matmul(&self.w_hh.t()?)?
+            + self.b_hh.broadcast_as((m, 3 * self.hidden))?)?;
+        let chunk =
+            |t: &Tensor, i: usize| -> Result<Tensor> { t.narrow(1, i * self.hidden, self.hidden) };
         let (i_r, i_z, i_n) = (chunk(&gi, 0)?, chunk(&gi, 1)?, chunk(&gi, 2)?);
         let (h_r, h_z, h_n) = (chunk(&gh, 0)?, chunk(&gh, 1)?, chunk(&gh, 2)?);
         let r = candle_nn::ops::sigmoid(&(i_r + h_r)?)?;
@@ -920,7 +1101,8 @@ impl CountLstmStep0 {
         let n = (i_n + (r * h_n)?)?.tanh()?;
         let one_minus_z = z.affine(-1.0, 1.0)?;
         let h1 = ((one_minus_z * n)? + (z * field_states)?)?;
-        self.projector.forward(&Tensor::cat(&[&h1, field_states], 1)?)
+        self.projector
+            .forward(&Tensor::cat(&[&h1, field_states], 1)?)
     }
 }
 
@@ -937,9 +1119,30 @@ impl SpanRep {
     pub fn load(vb: VarBuilder, hidden: usize, max_width: usize) -> Result<Self> {
         let vb = vb.pp("span_rep_layer");
         Ok(Self {
-            project_start: TwoLayerMlp::load(vb.pp("project_start"), hidden, 4 * hidden, hidden, "0", "3")?,
-            project_end: TwoLayerMlp::load(vb.pp("project_end"), hidden, 4 * hidden, hidden, "0", "3")?,
-            out_project: TwoLayerMlp::load(vb.pp("out_project"), 2 * hidden, 4 * hidden, hidden, "0", "3")?,
+            project_start: TwoLayerMlp::load(
+                vb.pp("project_start"),
+                hidden,
+                4 * hidden,
+                hidden,
+                "0",
+                "3",
+            )?,
+            project_end: TwoLayerMlp::load(
+                vb.pp("project_end"),
+                hidden,
+                4 * hidden,
+                hidden,
+                "0",
+                "3",
+            )?,
+            out_project: TwoLayerMlp::load(
+                vb.pp("out_project"),
+                2 * hidden,
+                4 * hidden,
+                hidden,
+                "0",
+                "3",
+            )?,
             max_width,
         })
     }
@@ -947,7 +1150,11 @@ impl SpanRep {
     /// `token_states`: `[L, H]` text-word states. Returns span representations
     /// `[N, H]` for every valid `(start, width)` with `start + width < L`, in
     /// the same order as the returned `(start, width)` list.
-    pub fn compute(&self, token_states: &Tensor, device: &Device) -> Result<(Tensor, Vec<(usize, usize)>)> {
+    pub fn compute(
+        &self,
+        token_states: &Tensor,
+        device: &Device,
+    ) -> Result<(Tensor, Vec<(usize, usize)>)> {
         let l = token_states.dim(0)?;
         let hidden = token_states.dim(1)?;
         let start_rep = self.project_start.forward(token_states)?;
@@ -967,7 +1174,10 @@ impl SpanRep {
             }
         }
         if pairs.is_empty() {
-            return Ok((Tensor::zeros((0, hidden), start_rep.dtype(), device)?, pairs));
+            return Ok((
+                Tensor::zeros((0, hidden), start_rep.dtype(), device)?,
+                pairs,
+            ));
         }
         let s_idx = Tensor::from_vec(starts, pairs.len(), device)?;
         let e_idx = Tensor::from_vec(ends, pairs.len(), device)?;
@@ -999,7 +1209,11 @@ pub struct RelationScorer {
 
 impl RelationScorer {
     pub fn load(vb: VarBuilder, hidden: usize, cfg: &BoundaryHeadConfig) -> Result<Self> {
-        let rel_dim = if cfg.directional_relation_states { 2 * hidden } else { hidden };
+        let rel_dim = if cfg.directional_relation_states {
+            2 * hidden
+        } else {
+            hidden
+        };
         let biaffine = if cfg.relation_biaffine_content {
             Some((
                 linear(hidden, hidden, vb.pp("head_content_projection"))?,
@@ -1019,7 +1233,14 @@ impl RelationScorer {
     }
 
     /// `text`: `[n, H]`, `relation_states`: `[R, rel_dim]`. Returns one logit per pair.
-    pub fn forward(&self, text: &Tensor, relation_states: &Tensor, pairs: &[RelationPair]) -> Result<Vec<f32>> {
+    #[tracing::instrument(skip(self, text, relation_states, pairs), fields(num_pairs = pairs.len()))]
+    pub fn forward(
+        &self,
+        text: &Tensor,
+        relation_states: &Tensor,
+        pairs: &[RelationPair],
+    ) -> Result<Vec<f32>> {
+        let _t = timed_block("RelationScorer::forward");
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1028,13 +1249,17 @@ impl RelationScorer {
         let p = pairs.len();
         let last = n.saturating_sub(1);
         let gather = |pos: Vec<usize>| -> Result<Tensor> {
-            text.index_select(&u32_tensor(pos.into_iter().map(|x| x.min(last)), device)?, 0)
+            text.index_select(
+                &u32_tensor(pos.into_iter().map(|x| x.min(last)), device)?,
+                0,
+            )
         };
         let h_start = gather(pairs.iter().map(|x| x.head.0).collect())?;
         let h_end = gather(pairs.iter().map(|x| x.head.1.saturating_sub(1)).collect())?;
         let t_start = gather(pairs.iter().map(|x| x.tail.0).collect())?;
         let t_end = gather(pairs.iter().map(|x| x.tail.1.saturating_sub(1)).collect())?;
-        let rel = relation_states.index_select(&u32_tensor(pairs.iter().map(|x| x.relation), device)?, 0)?;
+        let rel = relation_states
+            .index_select(&u32_tensor(pairs.iter().map(|x| x.relation), device)?, 0)?;
 
         let mut positional = Vec::with_capacity(2 * p);
         for pair in pairs {
@@ -1056,9 +1281,13 @@ impl RelationScorer {
             let pool = |spans: Vec<(usize, usize)>| -> Result<Tensor> {
                 let starts = u32_tensor(spans.iter().map(|s| s.0.min(n)), device)?;
                 let ends = u32_tensor(spans.iter().map(|s| s.1.min(n)), device)?;
-                let widths: Vec<f32> = spans.iter().map(|s| s.1.saturating_sub(s.0).max(1) as f32).collect();
+                let widths: Vec<f32> = spans
+                    .iter()
+                    .map(|s| s.1.saturating_sub(s.0).max(1) as f32)
+                    .collect();
                 let widths = Tensor::from_vec(widths, (spans.len(), 1), device)?;
-                (prefix.index_select(&ends, 0)? - prefix.index_select(&starts, 0)?)?.broadcast_div(&widths)
+                (prefix.index_select(&ends, 0)? - prefix.index_select(&starts, 0)?)?
+                    .broadcast_div(&widths)
             };
             let head_content = head_proj.forward(&pool(pairs.iter().map(|x| x.head).collect())?)?;
             let tail_content = tail_proj.forward(&pool(pairs.iter().map(|x| x.tail).collect())?)?;
@@ -1094,6 +1323,9 @@ mod tests {
         let keys = [9, 2, 4];
         let scores = [1.0, 1.0, 1.0];
         let valid = [true, true, true];
-        assert_eq!(deduplicate_pool(&keys, &scores, &valid, 10, 4), vec![2, 4, 9]);
+        assert_eq!(
+            deduplicate_pool(&keys, &scores, &valid, 10, 4),
+            vec![2, 4, 9]
+        );
     }
 }

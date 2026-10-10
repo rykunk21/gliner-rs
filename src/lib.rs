@@ -14,6 +14,27 @@
 //! println!("{result}");
 //! # anyhow::Ok(())
 //! ```
+//!
+//! ## Tracing / Timing
+//!
+//! The crate emits `tracing` spans and timing events for every major pipeline
+//! phase (prepare, encode, head forward, decode, chunking, etc.).
+//!
+//! To see them in a downstream application, install a `tracing-subscriber`
+//! (add `tracing-subscriber = "0.3"` to your `Cargo.toml`) and initialise it
+//! before calling any extraction method:
+//!
+//! ```ignore
+//! tracing_subscriber::fmt::init();
+//! // or with a filter:
+//! // tracing_subscriber::fmt().with_env_filter("info").init();
+//! ```
+//!
+//! Then run your application with the `RUST_LOG` environment variable:
+//!
+//! ```bash
+//! RUST_LOG=info cargo run
+//! ```
 
 pub mod chunking;
 pub mod cli_schema;
@@ -33,6 +54,7 @@ pub mod safetensors32;
 pub mod schema;
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod server;
+mod timing;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
@@ -42,6 +64,6 @@ pub use model::{ExtractOptions, GLiNER2};
 pub use processor::WordSplitter;
 pub use records::Cardinality;
 pub use schema::{
-    AttributeGroup, ClassActivation, ClassificationSpec, EntityDtype, EntitySpec, FieldDtype, FieldSpec,
-    RegexValidator, RelationSpec, Schema, StructureMode, StructureSpec, ValidatorMode,
+    AttributeGroup, ClassActivation, ClassificationSpec, EntityDtype, EntitySpec, FieldDtype,
+    FieldSpec, RegexValidator, RelationSpec, Schema, StructureMode, StructureSpec, ValidatorMode,
 };

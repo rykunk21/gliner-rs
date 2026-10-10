@@ -8,6 +8,7 @@ use regex::Regex;
 use tokenizers::Tokenizer;
 
 use crate::schema::Schema;
+use crate::timing::timed_block;
 
 pub const SEP_STRUCT: &str = "[SEP_STRUCT]";
 pub const SEP_TEXT: &str = "[SEP_TEXT]";
@@ -71,7 +72,11 @@ impl WordSplitter {
             let char_start = char_cursor;
             char_cursor += m.as_str().chars().count();
             byte_cursor = m.end();
-            let token = if lower { m.as_str().to_lowercase() } else { m.as_str().to_string() };
+            let token = if lower {
+                m.as_str().to_lowercase()
+            } else {
+                m.as_str().to_string()
+            };
             words.push(Word {
                 text: token,
                 byte_start: m.start(),
@@ -160,7 +165,12 @@ fn transform_schema(
             }
         }
     }
-    let mut tokens = vec!["(".to_string(), P_TOKEN.to_string(), prompt_str, "(".to_string()];
+    let mut tokens = vec![
+        "(".to_string(),
+        P_TOKEN.to_string(),
+        prompt_str,
+        "(".to_string(),
+    ];
     for field in fields {
         tokens.push(child_prefix.to_string());
         tokens.push(field.clone());
@@ -172,7 +182,10 @@ fn transform_schema(
 
 impl Processor {
     pub fn new(tokenizer: Tokenizer) -> Self {
-        Self { tokenizer, word_splitter: WordSplitter::default() }
+        Self {
+            tokenizer,
+            word_splitter: WordSplitter::default(),
+        }
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -183,7 +196,10 @@ impl Processor {
         let mut groups = Vec::new();
 
         for (index, structure) in schema.structures.iter().enumerate() {
-            if schema.structures[..index].iter().any(|s| s.name == structure.name) {
+            if schema.structures[..index]
+                .iter()
+                .any(|s| s.name == structure.name)
+            {
                 continue;
             }
             let fields: Vec<String> = structure.fields.iter().map(|f| f.name.clone()).collect();
@@ -192,8 +208,16 @@ impl Processor {
                 .iter()
                 .filter_map(|f| f.description.clone().map(|d| (f.name.clone(), d)))
                 .collect();
-            let tokens =
-                transform_schema(&structure.name, &fields, C_TOKEN, None, &[], &descs, !descs.is_empty(), false);
+            let tokens = transform_schema(
+                &structure.name,
+                &fields,
+                C_TOKEN,
+                None,
+                &[],
+                &descs,
+                !descs.is_empty(),
+                false,
+            );
             groups.push(PromptGroup {
                 kind: TaskKind::Structures,
                 spec_index: index,
@@ -212,8 +236,16 @@ impl Processor {
                 .iter()
                 .filter_map(|e| e.description.clone().map(|d| (e.name.clone(), d)))
                 .collect();
-            let tokens =
-                transform_schema("entities", &fields, E_TOKEN, None, &[], &descs, !descs.is_empty(), false);
+            let tokens = transform_schema(
+                "entities",
+                &fields,
+                E_TOKEN,
+                None,
+                &[],
+                &descs,
+                !descs.is_empty(),
+                false,
+            );
             groups.push(PromptGroup {
                 kind: TaskKind::Entities,
                 spec_index: 0,
@@ -283,7 +315,9 @@ impl Processor {
         for structure in &schema.structures {
             let mut inner: Vec<String> = Vec::new();
             for field in &structure.fields {
-                let Some(choices) = &field.choices else { continue };
+                let Some(choices) = &field.choices else {
+                    continue;
+                };
                 inner.push(field.name.clone());
                 inner.push("(".into());
                 for (i, choice) in choices.iter().enumerate() {
@@ -307,7 +341,14 @@ impl Processor {
     }
 
     /// Build model inputs for one text (`_transform_record` + `_format_input_with_mapping`).
-    pub fn prepare(&self, text: &str, schema: &Schema, max_words: Option<usize>) -> Result<PreparedInput> {
+    #[tracing::instrument(skip(self, schema, max_words), fields(text_len = text.len()))]
+    pub fn prepare(
+        &self,
+        text: &str,
+        schema: &Schema,
+        max_words: Option<usize>,
+    ) -> Result<PreparedInput> {
+        let _t = timed_block("Processor::prepare");
         let text = if text.is_empty() {
             ".".to_string()
         } else if text.ends_with(['.', '!', '?']) {
@@ -375,7 +416,14 @@ impl Processor {
             }
             input_ids.extend_from_slice(encoding.get_ids());
         }
-        Ok(PreparedInput { text, input_ids, prefix_tokens, words, word_positions, groups })
+        Ok(PreparedInput {
+            text,
+            input_ids,
+            prefix_tokens,
+            words,
+            word_positions,
+            groups,
+        })
     }
 }
 
@@ -385,11 +433,23 @@ mod tests {
 
     #[test]
     fn whitespace_splitter_matches_reference_patterns() {
-        let words = WordSplitter::Whitespace.split("Email me at Bob.Smith@example.com, see https://x.io/a?b ok-ish", true);
+        let words = WordSplitter::Whitespace.split(
+            "Email me at Bob.Smith@example.com, see https://x.io/a?b ok-ish",
+            true,
+        );
         let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(
             texts,
-            ["email", "me", "at", "bob.smith@example.com", ",", "see", "https://x.io/a?b", "ok-ish"]
+            [
+                "email",
+                "me",
+                "at",
+                "bob.smith@example.com",
+                ",",
+                "see",
+                "https://x.io/a?b",
+                "ok-ish"
+            ]
         );
     }
 
@@ -421,7 +481,18 @@ mod tests {
         );
         assert_eq!(
             tokens,
-            ["(", "[P]", "entities [DESCRIPTION] person: a human", "(", "[E]", "person", "[E]", "company", ")", ")"]
+            [
+                "(",
+                "[P]",
+                "entities [DESCRIPTION] person: a human",
+                "(",
+                "[E]",
+                "person",
+                "[E]",
+                "company",
+                ")",
+                ")"
+            ]
         );
     }
 }
